@@ -491,6 +491,94 @@ def _unsupported_numbers(text, reference):
     return found
 
 
+# What a narration may never say (every mood and format), and number words the
+# digit check misses ("six eggs", "twice a year").
+BANNED_WORDS = ("photo", "photos", "image", "images", "picture", "pictures", "slide", "slides")
+SMALL_NUMBERS = ("two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+                 "twice", "thrice")
+
+
+def _check(text, rec):
+    """What's wrong with a narration for its photo's request (rec, from _narrate):
+    a list of short reasons, empty when it passes every check."""
+    import re
+
+    low, wrong = text.lower(), []
+    count = len(text.split())
+    if count > rec["most"]:
+        wrong.append(f"too long ({count} words for {rec['words']})")
+    if count < max(3, (rec["min_words"] or rec["words"] // 2)):
+        wrong.append(f"too short ({count} words)")
+    found = [w for w in BANNED_WORDS if re.search(rf"\b{w}\b", low)] + (["right now"] if "right now" in low else [])
+    if found:
+        wrong.append("says " + ", ".join(found))
+    name = re.sub(r"\s*\(.*?\)", "", rec["name"]).strip().lower()
+    if name and not rec["unsure"]:
+        if not rec["named_before"] and name not in low:
+            wrong.append(f"doesn't name the {rec['name']}")
+        elif rec["named_before"] and name in low:
+            wrong.append(f"names the {rec['name']} again")
+    known = rec["known"].lower()
+    numbers = _unsupported_numbers(text, rec["known"]) + [
+        w for w in SMALL_NUMBERS if re.search(rf"\b{w}\b", low) and not re.search(rf"\b{w}\b", known)]
+    if numbers:
+        wrong.append("unbacked numbers: " + ", ".join(dict.fromkeys(numbers)))
+    grams = lambda t: {" ".join(g) for g in zip(*[re.findall(r"[a-z']+", t.lower())[k:] for k in range(4)])}  # noqa: E731
+    repeated = grams(text) & grams(" ".join(rec["previous"]))
+    if repeated:
+        wrong.append("repeats: " + sorted(repeated)[0])
+    if rec["ask"] and not any(w in low for w in rec["ask"]):
+        wrong.append("misses the question to the viewer")
+    return wrong
+
+
+def _training_pairs(records, writer, temperature, seed, k, mood):
+    """Per photo: k more narrations from the writer for the same request, then
+    every one (first draft, extras, the final text) checked; the best that
+    passes every check (closest to the word target) vs the worst. A photo
+    whose narrations all pass, or all fail, gives no pair."""
+    schema = {"type": "object", "properties": {"narration": {"type": "string"}}, "required": ["narration"]}
+    pairs = []
+    for rec in records:
+        texts = [rec["draft"]]
+        for j in range(k):
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            reply = _llm_json(writer, rec["prompt"], schema, max(temperature, 0.8), seed + 7001 + 37 * j + rec["moment"])
+            text = str(reply.get("narration", "")).replace("*", "").strip()
+            if text:
+                texts.append(text)
+        texts.append(rec["final"])
+        rated = [(t, _check(t, rec)) for t in dict.fromkeys(texts)]
+        good = [(t, w) for t, w in rated if not w]
+        bad = [(t, w) for t, w in rated if w]
+        if not good or not bad:
+            continue
+        chosen = min(good, key=lambda x: abs(len(x[0].split()) - rec["words"]))
+        rejected = max(bad, key=lambda x: (len(x[1]), len(x[0].split())))
+        pairs.append({"mood": mood, "moment": rec["moment"], "of": rec["of"], "target_words": rec["words"],
+                      "prompt": rec["prompt"], "chosen": chosen[0], "rejected": rejected[0],
+                      "rejected_reasons": rejected[1], "source": "auto", "writer": writer})
+    print(f"[documentary] training: {len(pairs)} pairs from {len(records)} photos")
+    return pairs
+
+
+def _trim_words(text, most):
+    """Whole sentences of text, at most `most` words; a first sentence that is
+    longer alone is cut and closed with a full stop."""
+    import re
+
+    kept, count = [], 0
+    for sentence in re.split(r"(?<=[.!?…])\s+", text.strip()):
+        n = len(sentence.split())
+        if count + n > most:
+            break
+        kept.append(sentence)
+        count += n
+    if kept:
+        return " ".join(kept)
+    return " ".join(text.split()[:most]).rstrip(",;:—-") + "."
+
+
 def _drop_sentences_with(text, numbers):
     """The narration without the sentences that hold one of `numbers` (at least one sentence stays)."""
     import re
@@ -626,6 +714,10 @@ class DocumentaryStory:
         optional = {f"image_{i}": (IMAGE_IN,) for i in range(1, MAX_IMAGES + 1)}
         optional["prompts"] = (PROMPTS, {"tooltip": "From Documentary Prompts: the prompts as you edited them. "
                                                     "Not connected: the built-in ones"})
+        optional["candidates"] = ("INT", {"default": 0, "min": 0, "max": 8,
+                                          "tooltip": "Training data: per photo this many extra narrations, all "
+                                                     "checked automatically; output 'training' has the pairs (best "
+                                                     "that passes every check vs worst). 0 = off"})
         for i in range(1, MAX_IMAGES + 1):
             optional[f"note_{i}"] = ("STRING", {
                 "default": "", "placeholder": f"Optional: about image {i} (what or who it is, what is happening)",
@@ -676,8 +768,8 @@ class DocumentaryStory:
             "optional": optional,
         }
 
-    RETURN_TYPES = (STORYBOARD, "STRING")
-    RETURN_NAMES = ("storyboard", "story")
+    RETURN_TYPES = (STORYBOARD, "STRING", "STRING")
+    RETURN_NAMES = ("storyboard", "story", "training")
     FUNCTION = "run"
     CATEGORY = "documentary"
 
@@ -685,6 +777,9 @@ class DocumentaryStory:
             narration_override, target=TARGETS[0], max_seconds=0.0, camera_details=CAMERA_DETAILS[0],
             species_id=SPECIES_ID[0], species_min_confidence=0.5, avoid_moods="", **kwargs):
         p = kwargs.pop("prompts", None) or DEFAULT_PROMPTS
+        candidates = int(kwargs.pop("candidates", 0) or 0)
+        self._record = []  # each photo's writer request and answer (_narrate)
+        training = ""
         shots = _collect(kwargs)
         n = len(shots)
         if n < MIN_IMAGES:
@@ -709,6 +804,11 @@ class DocumentaryStory:
         shot_list = None if custom_style.strip() else p["formats"].get(mood)
         if shot_list:
             words_per_image = shot_list["words"][1]
+            if reel:
+                # A format's words per photo, but no more than the reel's length allows
+                # (9 photos in 50 s left 8-12 words each 30 % too long: rushed).
+                words_per_image = min(words_per_image, _reel_words(n, max_seconds))
+                shot_list = {**shot_list, "words": (min(shot_list["words"][0], words_per_image), words_per_image)}
         elif reel:
             words_per_image = _reel_words(n, max_seconds)
         elif limit > 0:
@@ -727,6 +827,10 @@ class DocumentaryStory:
                                                        10 if reel else 20, avoid, shot_list, p, mood_name,
                                                        "instagram" if reel else "youtube")
             mood = extra.get("mood") or mood
+            if candidates > 0:
+                training = json.dumps({"mood": mood, "writer": writer, "seed": seed, "photos": n,
+                                       "pairs": _training_pairs(self._record, writer, temperature, seed, candidates,
+                                                                mood)}, ensure_ascii=False)
         # Camera details: on the slides the writer chose (all of them without the writer), or as set.
         shown = {"always": [True] * n, "never": [False] * n}.get(camera_details) or extra.get("show_details") \
             or [True] * n
@@ -742,7 +846,7 @@ class DocumentaryStory:
         return ({"images": images, "texts": texts, "title": title, "hook": hook, "outro": outro, "mood": mood,
                  "custom_style": custom_style.strip(), "brief": brief.strip(), "subjects": subjects,
                  "language": language, "target": target, "max_seconds": limit, "details": details,
-                 "motions": motions, "cover": cover, "prompts": p, "seed": seed}, story)
+                 "motions": motions, "cover": cover, "prompts": p, "seed": seed}, story, training)
 
     @staticmethod
     def _species(images, names, notes, mode, min_confidence):
@@ -909,6 +1013,7 @@ class DocumentaryStory:
             text = str(reply.get("narration", "")).strip()
             if not text:
                 raise RuntimeError(f"{writer} wrote no narration for image {index + 1}; run again or change the seed")
+            draft = text
             # The writer overruns "at most N words", and Narrate can only speed up so much;
             # a shot list's limit is strict (two tries).
             for attempt in range(2 if shot_list else 1):
@@ -922,6 +1027,12 @@ class DocumentaryStory:
                                                   "required": ["narration"]}, temperature,
                                   seed + index + 201 + 50 * attempt)
                 text = str(reply.get("narration", "")).strip() or text
+            # Still too long: whole sentences up to the limit (mistral-nemo wrote 275
+            # words for a 50 s reel; Narrate's speed-up can't save that).
+            most = words if shot_list else round(words * 1.2)
+            if len(text.split()) > most:
+                print(f"[documentary] moment {index + 1}: still {len(text.split())} words for {words}: trimmed")
+                text = _trim_words(text, most)
             # True numbers: the species' facts, the photographer's note (a date, a
             # count) and, for LENS_MOODS, the camera settings.
             known_text = f"{shot.get('reference', '')} {shot.get('photographer_note', '')} {shot.get('camera', '')}"
@@ -954,6 +1065,13 @@ class DocumentaryStory:
                     text = f"{text} {shot_list['ask_line'].replace('{n}', str(n))}"
             # Markdown emphasis (*poses*) would show in the subtitles.
             texts.append(text.replace("*", "").strip())
+            if getattr(self, "_record", None) is not None:
+                self._record.append({
+                    "moment": index + 1, "of": n, "prompt": prompt, "words": words, "most": most,
+                    "min_words": shot_list["words"][0] if shot_list else None, "name": shot.get("name") or "",
+                    "named_before": shot.get("name") in named, "unsure": bool(known[index]["animal"]),
+                    "known": known_text, "previous": texts[:-1], "ask": list(ask or []),
+                    "draft": draft, "final": texts[-1]})
             named.add(shot.get("name"))
         extra = {k: str(plan.get(k, "")).replace("*", "").strip().strip('"') for k in ("hook", "outro")}
         if jobs and not 3 <= len(extra["hook"].split()) <= 4:
@@ -1067,6 +1185,13 @@ class NarrateStoryboard:
                 "max_speedup": ("FLOAT", {"default": 1.25, "min": 1.0, "max": 2.0, "step": 0.05,
                                           "tooltip": "When the video would run over its length limit, the narration "
                                                      "is sped up, at most this much (1.0 = never)"}),
+                "pronunciations": ("STRING", {"multiline": True, "default": DEFAULT_PRONUNCIATIONS,
+                                              "tooltip": "Words the voice says wrong, one per line: 'word: how to say "
+                                                         "it'. Only the voice hears the respelling; subtitles keep "
+                                                         "the word"}),
+                "sentence_pause": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.5, "step": 0.05,
+                                             "tooltip": "Seconds of silence between sentences (Chatterbox speaks "
+                                                        "each sentence on its own)"}),
             },
         }
 
@@ -1079,7 +1204,8 @@ class NarrateStoryboard:
         return _local_first(lambda: self._run(*args, **kwargs))
 
     def _run(self, storyboard, voice, speed, engine="kokoro", intensity=0.0, outro="", max_speedup=1.25,
-             my_voice=None):
+             my_voice=None, pronunciations=None, sentence_pause=0.2):
+        say = _respeller(DEFAULT_PRONUNCIATIONS if pronunciations is None else pronunciations)
         preset = {**VOICE_PRESETS[DEFAULT_MOOD], **VOICE_PRESETS.get(storyboard.get("mood"), {})}
         if voice != AUTO_VOICE:
             preset["voice"] = voice
@@ -1107,9 +1233,10 @@ class NarrateStoryboard:
             preset["stretch"] = 1.0
             engine = "chatterbox"
         if engine == "kokoro":
-            clips, timings = _kokoro_clips(texts, preset["voice"], preset["kokoro_speed"] * speed, device)
+            clips, timings = _kokoro_clips([say(t) for t in texts], preset["voice"], preset["kokoro_speed"] * speed,
+                                           device)
         else:
-            clips, timings = _chatterbox_clips(texts, preset, speed, device)
+            clips, timings = _chatterbox_clips(texts, preset, speed, device, say, sentence_pause)
         if _limit(storyboard) > 0:
             clips, timings = _fit_length(storyboard, clips, timings, n, max_speedup)
         full = np.concatenate(clips)
@@ -1259,6 +1386,27 @@ def _own_voice(audio, seconds=20.0):
     return path
 
 
+# Words the voices say wrong (your model test, 2026-11-01: "noothatch").
+DEFAULT_PRONUNCIATIONS = "# word: how to say it\nNuthatch: nut hatch\n"
+
+
+def _respeller(rules):
+    """A function: text -> text with each listed word respelled (whole words, any case)."""
+    import re
+
+    pairs = []
+    for line in (rules or "").splitlines():
+        word, sep, said = line.partition(":")
+        if sep and word.strip() and said.strip() and not line.lstrip().startswith("#"):
+            pairs.append((re.compile(rf"\b{re.escape(word.strip())}(e?s)?\b", re.I), said.strip()))
+
+    def say(text):
+        for pattern, said in pairs:
+            text = pattern.sub(lambda m: said + (m.group(1) or ""), text)
+        return text
+    return say
+
+
 def _sentences(text, limit=300):
     """Chunks of whole sentences up to ~limit characters: Chatterbox stops after
     about 40 s of speech per call."""
@@ -1276,21 +1424,26 @@ def _sentences(text, limit=300):
     return chunks
 
 
-def _chatterbox_clips(texts, preset, speed, device):
+def _chatterbox_clips(texts, preset, speed, device, say=None, pause=0.0):
+    """One clip per text. Each sentence is spoken on its own (a long chunk made
+    Chatterbox rush, run sentences together or repeat words), with `pause`
+    seconds of silence between; `say` respells words for the voice only."""
     import librosa
 
+    say = say or (lambda t: t)
     model = _chatterbox_model(device)
     try:
         reference = preset.get("reference") or _reference_clip(preset["voice"], device)
         stretch = preset["stretch"] * speed
+        gap = np.zeros(int(model.sr * pause), dtype=np.float32)
         clips, timings = [], []
         for text in texts:
-            parts, chunks = [], _sentences(text)
-            for chunk in chunks:
+            parts, chunks = [], _sentences(text, limit=1)
+            for k, chunk in enumerate(chunks):
                 comfy.model_management.throw_exception_if_processing_interrupted()
-                wav = model.generate(chunk, audio_prompt_path=reference, exaggeration=preset["intensity"],
+                wav = model.generate(say(chunk), audio_prompt_path=reference, exaggeration=preset["intensity"],
                                      cfg_weight=preset["cfg"]).squeeze(0).cpu().numpy().astype(np.float32)
-                parts.append(wav)
+                parts.append(np.concatenate([wav, gap]) if k < len(chunks) - 1 and len(gap) else wav)
             clip = np.concatenate(parts)
             raw = len(clip)
             if model.sr != KOKORO_RATE:
