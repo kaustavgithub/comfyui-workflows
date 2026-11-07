@@ -52,6 +52,7 @@ import folder_paths
 import nodes
 from comfy_api.latest import InputImpl
 
+from . import llm_restore
 from . import look as look_mod
 from . import prompts as prompt_texts
 from . import species as species_id
@@ -67,6 +68,8 @@ MAX_IMAGES = 10
 # these nodes may switch models (the gate refuses that to normal users).
 LLM_URL = os.environ.get("DOC_LLM_URL", "http://llm.llm.svc.cluster.local:8080").rstrip("/")
 LLM_TOKEN = os.environ.get("DOC_LLM_TOKEN", "")
+# After a run, the LLMs that were loaded before it are loaded again (llm_restore.py).
+LLM_RESTORE = llm_restore.Restorer(LLM_URL, LLM_TOKEN)
 
 # Kokoro-82M (Apache-2.0). Weights download once into the models volume.
 KOKORO_REPO = "hexgrad/Kokoro-82M"
@@ -437,6 +440,7 @@ LOOK_SCHEMA = {
 
 
 def _llm_request(path, body=None, timeout=900):
+    LLM_RESTORE.remember((body or {}).get("model"))
     headers = {"Content-Type": "application/json"}
     if LLM_TOKEN:
         headers["Authorization"] = f"Bearer {LLM_TOKEN}"
@@ -3168,6 +3172,33 @@ try:
         return web.json_response(_storage_delete(body.get("files", [])))
 except (ImportError, AttributeError):
     pass  # not running inside ComfyUI's server
+
+
+def _hook_job_end():
+    """Tell LLM_RESTORE when ComfyUI finishes a job: PromptQueue.task_done runs
+    once per job, success or error (ComfyUI 0.39 has no hook for this)."""
+    try:
+        import execution
+    except ImportError:
+        return  # not inside ComfyUI
+    queue_cls = getattr(execution, "PromptQueue", None)
+    done = getattr(queue_cls, "task_done", None)
+    if done is None or getattr(done, "_documentary", False):
+        return
+
+    def task_done(self, *args, **kwargs):
+        result = done(self, *args, **kwargs)
+        try:
+            LLM_RESTORE.after_job(self)
+        except Exception as e:  # never break ComfyUI's queue
+            print(f"[documentary] LLM reload after the run failed: {e}")
+        return result
+
+    task_done._documentary = True
+    queue_cls.task_done = task_done
+
+
+_hook_job_end()
 
 WEB_DIRECTORY = "./web"
 
